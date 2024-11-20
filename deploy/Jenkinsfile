@@ -1,0 +1,138 @@
+pipeline {
+    agent {
+      node {
+        label 'maven'
+      }
+    }
+
+      parameters {
+          string(name:'APP_NAME',defaultValue: 'demoservice',description:'应用名称 必须使用小写 需跟maven构建中一致')
+          string(name:'PROJECT_NAMESPACE',defaultValue: 'service',description:'部署项目集名称')
+          string(name:'SERVICE_SRC_PATH',defaultValue: 'demo-service',description:'war包路径')
+          string(name:'TAG_NAME',defaultValue: '',description:'tag 发布线上必须填写 格式v20210101(v+当前日期)')
+          string(name:'PODCOUNT',defaultValue: '2',description:'部署pod数量')
+      }
+
+
+      environment {
+          //构建镜像
+          REGISTRY = 'hub.ychealth.cc'
+          DOCKERHUB_NAMESPACE = 'dev'
+          DOCKER_CREDENTIAL_ID = 'dockerhub-account' //hub账号密钥
+          GITHUB_CREDENTIAL_ID = 'gitlab-account' //gitlab账号密钥
+          //环境部署凭证
+          KUBECONFIG_CREDENTIAL_ID_DEV = 'testing-kubeconfig'
+          KUBECONFIG_CREDENTIAL_ID_VIEW = 'aliyun-testing'
+          KUBECONFIG_CREDENTIAL_ID_PROD = 'aliyun-prod'
+      }
+   stages {
+          stage ('clone代码') {
+              steps {
+                  checkout(scm)
+              }
+          }
+
+        /* 执行ut //
+          stage ('unit test') {
+              steps {
+                  container ('maven') {
+                      sh 'mvn clean -gs `pwd`/deploy/settings.xml test -Denv.build=$BUILD_ID -Denv.trackerror=true'
+                  }
+              }
+          }
+        //*/
+          stage ('编译项目') {
+              steps {
+                  container ('maven') {
+
+                      //***************************************
+                      //**************下载通用模版***************
+                      sh 'curl -o  `pwd`/deploy/start.sh http://gitlab.ychealth.cc/publicfile/deploy/-/raw/master/start.sh'
+                      sh 'curl -o `pwd`/deploy/settings.xml http://gitlab.ychealth.cc/publicfile/deploy/-/raw/master/setting.xml'
+                      sh 'curl -o `pwd`/deploy/Dockerfile http://gitlab.ychealth.cc/publicfile/deploy/-/raw/master/dockerfile/java-consul'
+
+                       sh 'mkdir `pwd`/deploy/yaml'
+                       sh 'curl -o `pwd`/deploy/yaml/devops-java.yaml http://gitlab.ychealth.cc/publicfile/deploy/-/raw/master/yaml/devops-java-v2.0.yaml'
+                       sh 'curl -o `pwd`/deploy/yaml/devops-java-svc.yaml http://gitlab.ychealth.cc/publicfile/deploy/-/raw/master/yaml/devops-java-svc.yaml'
+                      //***************************************
+
+
+                      sh 'mvn -Dmaven.test.skip=true -gs `pwd`/deploy/settings.xml clean package -U -Denv.trackerror=true'
+
+                      }
+                  }
+              }
+
+          stage('构建镜像并推送镜像到镜像仓库'){
+            // when{
+            //   branch 'master'
+            // }
+             steps{
+                  container ('maven') {
+                    sh 'docker build --build-arg SERVICE_SRC_PATH=$SERVICE_SRC_PATH \
+                       --build-arg GENERATE_PATH=generated-resources/appassembler/jsw/$APP_NAME \
+                       --build-arg RELEASE_NAME=$BRANCH_NAME-$BUILD_NUMBER \
+                       --build-arg APP_NAME=$APP_NAME \
+                       -f deploy/Dockerfile \
+                       -t $REGISTRY/$DOCKERHUB_NAMESPACE/$APP_NAME:$BRANCH_NAME-$BUILD_NUMBER-$TAG_NAME \
+                       --no-cache .'
+                      withCredentials([usernamePassword(passwordVariable : 'DOCKER_PASSWORD' ,usernameVariable : 'DOCKER_USERNAME' ,credentialsId : "$DOCKER_CREDENTIAL_ID" ,)]) {
+                          sh 'echo "$DOCKER_PASSWORD" | docker login $REGISTRY -u "$DOCKER_USERNAME" --password-stdin'
+                          sh 'docker push  $REGISTRY/$DOCKERHUB_NAMESPACE/$APP_NAME:$BRANCH_NAME-$BUILD_NUMBER-$TAG_NAME'
+                    sh 'docker tag  $REGISTRY/$DOCKERHUB_NAMESPACE/$APP_NAME:$BRANCH_NAME-$BUILD_NUMBER-$TAG_NAME $REGISTRY/$DOCKERHUB_NAMESPACE/$APP_NAME:latest '
+                    sh 'docker push  $REGISTRY/$DOCKERHUB_NAMESPACE/$APP_NAME:latest '
+
+                  }
+             }
+          }
+          }
+          stage('部署测试环境') {
+           // when{
+           //   branch 'master'
+           // }
+            steps {
+              //input(id: 'deploy-to-dev', message: 'deploy to dev?')
+              kubernetesDeploy(configs: 'deploy/yaml/**', enableConfigSubstitution: true, kubeconfigId: "$KUBECONFIG_CREDENTIAL_ID_DEV")
+            }
+          }
+        //  stage('代码打tag'){
+        //    when{
+        //      expression{
+        //        return params.TAG_NAME =~ /v.*/
+        //      }
+        //    }
+        //    steps { //缺少添加凭证
+        //      sh 'git config --global user.email "deploy@ychealth.net"'
+        //      sh 'git config --global user.name "deploy"'
+        //      sh 'git tag -a $TAG_NAME -m "auto deploy tag"'
+        //      sh 'git push origin --tags'
+        //    }
+        //  }
+        /*
+        //  stage('deploy to view') {
+        //    when{
+        //      expression{
+        //        return params.TAG_NAME =~ /v.*/
+        //      }
+        //    }
+        //    steps {
+        //      input(id: 'deploy-to-view', message: 'deploy to view?')
+        //      sh 'git tag -a $TAG_NAME'
+        //     kubernetesDeploy(configs: 'deploy/yaml/**', enableConfigSubstitution: true, kubeconfigId: "$KUBECONFIG_CREDENTIAL_ID_VIEW")
+        //    }
+         // }
+          //*/
+
+          stage('部署生产环境') {
+            when{
+              expression{
+                return params.TAG_NAME =~ /v.*/
+              }
+            }
+            steps {
+              input(id: 'deploy-to-prod', message: 'deploy to prod?')
+              kubernetesDeploy(configs: 'deploy/yaml/**', enableConfigSubstitution: true, kubeconfigId: "$KUBECONFIG_CREDENTIAL_ID_PROD")
+            }
+          }
+      }
+  }
